@@ -3,6 +3,7 @@
 #include "rclcpp/executors.hpp"
 
 #include "behaviortree_ros2/plugins.hpp"
+#include "behaviortree_cpp/loggers/groot2_publisher.h"
 
 #ifndef USE_SLEEP_PLUGIN
 #include "sleep_action.hpp"
@@ -78,8 +79,9 @@ int main(int argc, char **argv)
 #endif
 
   auto tree = factory.createTreeFromText(xml_text);
-
-  for(int i=0; i<5; i++){
+  BT::Groot2Publisher publisher(tree);
+  
+  for(int i=0; i<10; i++){
     tree.tickWhileRunning();
   }
 
