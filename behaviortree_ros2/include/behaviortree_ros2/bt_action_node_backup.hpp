@@ -105,7 +105,10 @@ public:
   static PortsList providedBasicPorts(PortsList addition)
   {
     PortsList basic = {
-      InputPort<std::string>("action_name", "__default__placeholder__", "Action server name")
+      InputPort<std::string>("action_name", "__default__placeholder__", "Action server name"),
+      OutputPort<rclcpp::Time>("time_goal_sent", "Time when the goal was sent"),
+      OutputPort<std::shared_future<typename GoalHandle::SharedPtr>>("future_goal_handle",
+                                                                     "Future to the goal handle")
     };
     basic.insert(addition.begin(), addition.end());
     return basic;
@@ -163,7 +166,7 @@ public:
   /// The default halt() implementation will call cancelGoal if necessary.
   void halt() override final;
 
-  NodeStatus tick() override final;
+  NodeStatus tick() override;
 
 protected:
 
@@ -445,7 +448,163 @@ template<class T> inline
   }
 }
 
+// customize
+template<class ActionT>
+class RosActionSendGoalNode : public RosActionNode<ActionT>
+{
+  public:
+    using RosActionNode<ActionT>::RosActionNode; // RosActionNode<ActionT> のコンストラクタを RosActionSendGoalNode でそのまま使用する
+    NodeStatus tick() override {
+      if(!action_client_ || (status() == NodeStatus::IDLE && action_name_may_change_))
+      {
+        std::string action_name;
+        getInput("action_name", action_name);
+        if(prev_action_name_ != action_name)
+        {
+          createClient(action_name);
+        }
+      }
 
+      //------------------------------------------
+      auto CheckStatus = [](NodeStatus status)
+      {
+        if( !isStatusCompleted(status) )
+        {
+          throw std::logic_error("RosActionNode: the callback must return either SUCCESS of FAILURE");
+        }
+        return status;
+      };
+
+      // first step to be done only at the beginning of the Action
+      if (status() == BT::NodeStatus::IDLE)
+      {
+        setStatus(NodeStatus::RUNNING);
+
+        goal_received_ = false;
+        future_goal_handle_ = {};
+        on_feedback_state_change_ = NodeStatus::RUNNING;
+        result_ = {};
+
+        Goal goal;
+
+        if( !setGoal(goal) )
+        {
+          return CheckStatus( onFailure(INVALID_GOAL) );
+        }
+
+        typename ActionClient::SendGoalOptions goal_options;
+
+        //--------------------
+        goal_options.feedback_callback =
+          [this](typename GoalHandle::SharedPtr,
+                const std::shared_ptr<const Feedback> feedback)
+        {
+          on_feedback_state_change_ = onFeedback(feedback);
+          if( on_feedback_state_change_ == NodeStatus::IDLE)
+          {
+            throw std::logic_error("onFeedback must not return IDLE");
+          }
+          emitWakeUpSignal();
+        };
+        //--------------------
+        goal_options.result_callback =
+          [this](const WrappedResult& result)
+        {
+          if (goal_handle_->get_goal_id() == result.goal_id) {
+            RCLCPP_DEBUG( node_->get_logger(), "result_callback" );
+            result_ = result;
+            emitWakeUpSignal();
+          }
+        };
+        //--------------------
+        goal_options.goal_response_callback =
+          [this](typename GoalHandle::SharedPtr const future_handle)
+        {
+          auto goal_handle_ = future_handle.get();
+          if (!goal_handle_)
+          {
+            RCLCPP_ERROR(node_->get_logger(), "Goal was rejected by server");
+          } else {
+            RCLCPP_DEBUG(node_->get_logger(), "Goal accepted by server, waiting for result");
+          }
+        };
+        //--------------------
+
+        future_goal_handle_ = action_client_->async_send_goal( goal, goal_options );
+        time_goal_sent_ = node_->now();
+
+        setOutput("time_goal_sent", time_goal_sent_);
+        setOutput("future_goal_handle", future_goal_handle_);
+
+        return NodeStatus::SUCCESS;
+      }
+    };
+};
+
+template<class ActionT>
+class RosActionGetResultNode : public RosActionNode<ActionT>
+{
+  public:
+    using RosActionNode<ActionT>::RosActionNode;
+    NodeStatus tick() override {
+      auto time_goal_sent_ = getInput("time_goal_sent", time_goal_sent_);
+      auto future_goal_handle_ = getInput("future_goal_handle", future_goal_handle_);
+
+      callback_group_executor_.spin_some();
+
+      // FIRST case: check if the goal request has a timeout
+      if( !goal_received_ )
+      {
+        auto nodelay = std::chrono::milliseconds(0);
+        auto timeout = rclcpp::Duration::from_seconds( double(server_timeout_.count()) / 1000);
+
+        auto ret = callback_group_executor_.spin_until_future_complete(future_goal_handle_, nodelay);
+        if (ret != rclcpp::FutureReturnCode::SUCCESS)
+        {
+          if( (node_->now() - time_goal_sent_) > timeout )
+          {
+            return CheckStatus( onFailure(SEND_GOAL_TIMEOUT) );
+          }
+          else{
+            return NodeStatus::RUNNING;
+          }
+        }
+        else
+        {
+          goal_received_ = true;
+          goal_handle_ = future_goal_handle_.get();
+          future_goal_handle_ = {};
+
+          if (!goal_handle_) {
+            throw std::runtime_error("Goal was rejected by the action server");
+          }
+        }
+      }
+
+      // SECOND case: onFeedback requested a stop
+      if( on_feedback_state_change_ != NodeStatus::RUNNING )
+      {
+        cancelGoal();
+        return on_feedback_state_change_;
+      }
+      // THIRD case: result received, requested a stop
+      if( result_.code != rclcpp_action::ResultCode::UNKNOWN)
+      {
+        if( result_.code == rclcpp_action::ResultCode::ABORTED )
+        {
+          return CheckStatus( onFailure( ACTION_ABORTED ) );
+        }
+        else if( result_.code == rclcpp_action::ResultCode::CANCELED )
+        {
+          return CheckStatus( onFailure( ACTION_CANCELLED ) );
+        }
+        else{
+          return CheckStatus( onResultReceived( result_ ) );
+        }
+      }
+      return NodeStatus::RUNNING;
+    }
+};
 
 
 }  // namespace BT
